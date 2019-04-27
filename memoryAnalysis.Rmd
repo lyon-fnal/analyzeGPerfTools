@@ -1,0 +1,155 @@
+---
+title: "Memory Analysis"
+output: html_notebook
+---
+
+# Process a dot file from gperftools and pprof
+
+First, we convert the dot file to json
+
+```{bash}
+dot -Tdot_json MemALlA_9_1_all.dot > MemALlA_9_1_all.dot.json
+```
+
+Now, we need some libraries
+```{r}
+library(tidyverse)
+library(tidygraph)
+library(ggraph)
+library(jsonlite)
+library(janitor)
+library(visNetwork)
+```
+
+Turn off an annoying warning (apparenlty due to an R bug that is still not fixed?)
+```{r}
+options(warnPartialMatchArgs = FALSE)
+```
+
+Load in the JSON file and parse it
+```{r}
+j <- fromJSON("MemALlA_9_1_all.dot.json")
+```
+
+The returned R object has `objects` which are the nodes and `edges` that are the connecting lines. We need to convert things to be accepted by `tidygraph`
+
+First of all, we only want nodes that are boxes (e.g. not the legend). We also want an `index` column. We need to figure out what to do with the label. Unfortunately, the label has many forms. Write some somefunctions to deal with it. 
+
+```{r}
+last <- function(x) { return( x[length(x)] ) }
+
+nWithPercent <- function(nS) {
+  # Capture things like "34.3 (56.3%)" where "of " in front is optional
+  r <- str_match(nS, "(?:of )*([0-9.]+) \\(([0-9.]+)%\\)")
+  
+  list(n=as.numeric(r[2]), p=as.numeric(r[3]))
+}
+
+
+splitUpNodeLabel <- function(label) {
+  # Break up by line
+  l = str_split(label,"\\\\n|\\\\r", simplify = TRUE)
+  
+  # The last line should be empty
+  # The 2nd to last line should be the total memory
+  totalLine = l[length(l)-1]
+  totals <- nWithPercent(totalLine)
+  totalMem <- totals$n
+  totalPerc <- totals$p
+  
+  # Is there a self?
+  selfMem <- NA
+  selfPerc <- NA
+  whereStart <- 2
+  if (str_detect(totalLine, "of ")) {
+    selfLine <- l[length(l)-2]
+    selfs <- nWithPercent(selfLine)
+    selfMem <- selfs$n
+    selfPerc <- selfs$p
+    whereStart <- 3
+  }
+  
+  # Get the fullPath
+  fullPath <- l[length(l) - whereStart]
+  
+  # Pull out the file and line
+  file <- str_split(fullPath, "/", simplify = TRUE) %>% last()
+  
+  # Merge the rest with spaces
+  fcn <- paste(l[1:(length(l)-whereStart-1)], collapse = " ")
+  
+  tibble(fcn=fcn, file=file, fullPath=fullPath, totalMem=totalMem, totalPerc=totalPerc, selfMem=selfMem, selfPerc=selfPerc)
+}
+```
+
+Make the nodes dataframe. Here, we use a `purrr` to run our label function that will return a dataframe. `unnest` will turn that into columns. 
+```{r}
+# See https://stackoverflow.com/a/49985224/819526
+nodes <- j$objects %>% 
+  clean_names() %>% 
+  filter(shape == "box") %>% 
+  rename(index = gvid) %>% 
+  mutate(f = map(label, splitUpNodeLabel)) %>% 
+  unnest(f) %>% 
+  mutate(name = fcn) %>% 
+  select(index, name, file, fullPath, totalMem, totalPerc, selfMem, selfPerc)
+```
+
+```{r}
+nodes
+```
+
+Let's next fix the edges. 
+
+```{r}
+edges <- j$edges %>% clean_names() %>% rename(from = tail, to = head) %>% mutate(mem = as.numeric(label)) %>% select(from, to, mem)
+```
+
+Make this into a graph
+
+```{r}
+g <- tbl_graph(nodes=nodes, edges=edges)
+g
+```
+
+Let's find the nodes where the allocations happens (these are at the bottom of the graphs)
+
+```{r}
+g %>% 
+  filter(node_is_sink()) %>% 
+  as_tibble() %>% 
+  select(index, name, totalMem, totalPerc) %>% 
+  arrange(-totalMem)
+```
+
+Let's look at the 2nd highest allocation (index #71). Chosen because it's simple but meaningful. 
+
+```{r}
+g %>% 
+  mutate(dist = dfs_dist(71, mode="in")) %>% 
+  filter(!is.na(dist)) %>% 
+  as_tibble() %>% 
+  arrange(dist) %>% 
+  select(index, name, file, totalMem, dist)
+```
+
+Plot the relevant parts
+
+```{r}
+g %>% 
+  mutate(dist = dfs_dist(71, mode="in")) %>% 
+  filter(dist < 5) %>% 
+  ggraph(layout="mds" ) + 
+    geom_edge_link(
+      aes(label=mem),
+      label_size=4,
+      angle_calc = 'along',
+      label_dodge = unit(4, 'mm'),
+      arrow = arrow(length = unit(4, "mm")),
+      start_cap = circle(6, "mm"),
+      end_cap = circle(6, "mm") ) + 
+    geom_node_text(
+      aes(label = index), size = 7) +
+    theme_graph()
+```
+
